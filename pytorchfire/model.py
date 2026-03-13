@@ -64,6 +64,36 @@ class WildfireModel(nn.Module):
             - dtype: `torch.float`
             - shape: `[]`
 
+        c_3 (torch.Parameter):
+            The scaling factor for temperature anomaly.
+
+            Controls how strongly deviations from the reference temperature amplify fire spread.
+            A value of 0 disables the temperature effect entirely.
+
+            - dtype: `torch.float`
+            - shape: `[]`
+
+        T_ref (torch.Tensor):
+            Per-cell reference temperature used to compute the temperature anomaly. Unit is degrees Celsius.
+
+            Loaded from the T_REF GeoTIFF exported alongside the daily temperature rasters, giving
+            each cell its own local seasonal baseline rather than a single county-wide scalar.
+
+            The anomaly is computed cell-wise as ``(temperature - T_ref) / T_ref``, so fire spread
+            is amplified where current temperature exceeds the local baseline and suppressed where it
+            falls below.
+
+            - dtype: `torch.float`
+            - shape: `[Height, Width]`
+
+        temperature (torch.Tensor):
+            Ambient temperature at each cell. Unit is degrees Celsius.
+
+            Updated each time step from weather data during simulation or calibration.
+
+            - dtype: `torch.float`
+            - shape: `[Height, Width]`
+
         p_continue (torch.Parameter):
             The probability that a burning cell continue to burn at next time step.
 
@@ -169,12 +199,15 @@ class WildfireModel(nn.Module):
     p_h: nn.Parameter
     c_1: nn.Parameter
     c_2: nn.Parameter
+    c_3: nn.Parameter
+    T_ref: torch.Tensor
     p_continue: nn.Parameter
     p_veg: torch.Tensor
     p_den: torch.Tensor
     wind_velocity: torch.Tensor
     wind_towards_direction: torch.Tensor
     slope: torch.Tensor
+    temperature: torch.Tensor
     initial_ignition: torch.Tensor
     state: torch.Tensor
     accumulator: torch.Tensor
@@ -205,6 +238,10 @@ class WildfireModel(nn.Module):
                     under normal conditions.
                 - `c_1` (torch.float): The scaling factor for wind velocity.
                 - `c_2` (torch.float): The scaling factor for wind direction.
+                - `c_3` (torch.float): The scaling factor for temperature anomaly. Defaults to ``0.0`` (disabled).
+                - `T_ref` (torch.Tensor): Per-cell reference temperature in degrees Celsius, shape ``[Height, Width]``.
+                    Loaded from the T_REF GeoTIFF produced by ``export_temperature_to_geotiff.py --save-t-ref``.
+                    Defaults to ``20.0`` at every cell when not provided.
                 - `p_continue` (torch.float): The probability that a burning cell continue to burn at next time step.
 
             keep_acc_mask (bool):
@@ -222,16 +259,27 @@ class WildfireModel(nn.Module):
                 'wind_velocity': torch.rand(SIZE, SIZE) * 10,
                 'wind_towards_direction': torch.rand(SIZE, SIZE) * 360,
                 'slope': torch.rand(SIZE, SIZE, 3, 3) * 90,
+                'temperature': torch.ones(SIZE, SIZE) * 25.0,  # degrees Celsius
                 'initial_ignition': torch.rand(SIZE, SIZE) > .9,
             }
+
+            # Load per-pixel T_ref from the T_REF GeoTIFF exported by
+            # export_temperature_to_geotiff.py --save-t-ref
+            import rasterio
+            with rasterio.open('T_REF_Plumas_CA_....tif') as src:
+                t_ref_array = src.read(1).astype('float32')
+            t_ref_tensor = torch.from_numpy(t_ref_array)  # shape [H, W]
+
             parameters = {
                 'a': torch.tensor(.1),
                 'p_h': torch.tensor(.3),
                 'c_1': torch.tensor(.1),
                 'c_2': torch.tensor(.1),
+                'c_3': torch.tensor(.0),   # start disabled; tune via calibration
+                'T_ref': t_ref_tensor,     # [H, W] per-pixel seasonal baseline
                 'p_continue': torch.tensor(.3),
             }
-            model = WildfireModel(env_data=environment_data, params=parameters) # Create a model with custom parameters
+            model = WildfireModel(env_data=environment_data, params=parameters)
             ```
         """
         super(WildfireModel, self).__init__()
@@ -244,8 +292,14 @@ class WildfireModel(nn.Module):
         self.register_parameter('p_h', nn.Parameter(params.get('p_h', torch.tensor(.3))))
         self.register_parameter('c_1', nn.Parameter(params.get('c_1', torch.tensor(.0))))
         self.register_parameter('c_2', nn.Parameter(params.get('c_2', torch.tensor(.0))))
+        self.register_parameter('c_3', nn.Parameter(params.get('c_3', torch.tensor(.0))))
         self.register_parameter('p_continue',
                                 nn.Parameter(params.get('p_continue', torch.tensor(.3)), requires_grad=False))
+
+        # T_ref is a fixed per-cell reference temperature (not learnable); stored as a buffer so it
+        # moves with the model across devices. Defaults to 20.0 °C at every cell when not provided.
+        # When loaded from a T_REF GeoTIFF, shape is [H, W], matching temperature and p_veg exactly.
+        self.register_buffer('T_ref', params.get('T_ref', torch.full_like(self.p_veg, 20.0)))
 
         self.register_buffer('p_veg', env_data.get('p_veg', torch.zeros(DEFAULT_SIZE, DEFAULT_SIZE)))
         self.register_buffer('p_den', env_data.get('p_den', torch.zeros_like(self.p_veg)))
@@ -253,6 +307,7 @@ class WildfireModel(nn.Module):
         self.register_buffer('wind_towards_direction',
                              env_data.get('wind_towards_direction', torch.zeros_like(self.p_veg)))
         self.register_buffer('slope', env_data.get('slope', repeat(torch.zeros_like(self.p_veg), 'h w -> h w 3 3')))
+        self.register_buffer('temperature', env_data.get('temperature', torch.full_like(self.p_veg, 20.0)))
         self.register_buffer('initial_ignition',
                              env_data.get('initial_ignition', torch.zeros_like(self.p_veg, dtype=torch.bool)))
         self.register_buffer('state', self._initialize_state(self.initial_ignition))
@@ -279,13 +334,13 @@ class WildfireModel(nn.Module):
             model.sanity_check()
             ```
         """
-        assert self.a.shape == self.p_h.shape == self.c_1.shape == self.c_2.shape == self.p_continue.shape == ()
+        assert self.a.shape == self.p_h.shape == self.c_1.shape == self.c_2.shape == self.c_3.shape == self.p_continue.shape == ()
         assert (
-                self.p_veg.shape == self.p_den.shape == self.wind_velocity.shape == self.wind_towards_direction.shape == self.initial_ignition.shape)
+                self.p_veg.shape == self.p_den.shape == self.wind_velocity.shape == self.wind_towards_direction.shape == self.temperature.shape == self.T_ref.shape == self.initial_ignition.shape)
         assert self.slope.shape == (*self.p_veg.shape, 3, 3)
         assert self.state.shape == (2, *self.p_veg.shape)
         assert (
-                self.a.device == self.p_h.device == self.c_1.device == self.c_2.device == self.p_continue.device == self.p_veg.device == self.p_den.device == self.wind_velocity.device == self.wind_towards_direction.device == self.slope.device == self.initial_ignition.device == self.state.device)
+                self.a.device == self.p_h.device == self.c_1.device == self.c_2.device == self.c_3.device == self.p_continue.device == self.p_veg.device == self.p_den.device == self.wind_velocity.device == self.wind_towards_direction.device == self.temperature.device == self.T_ref.device == self.slope.device == self.initial_ignition.device == self.state.device)
         assert self.initial_ignition.dtype == self.state.dtype == torch.bool
         if self.training:
             assert self.accumulator.shape == self.initial_ignition.shape
@@ -388,7 +443,13 @@ class WildfireModel(nn.Module):
         p_w = torch.exp(self.c_1 * wind_velocity_expanded) * torch.exp(self.c_2 * wind_velocity_expanded * (
                 torch.cos(torch.deg2rad((wind_offset_tiled - wind_towards_direction_expanded) % 360)) - 1))
 
-        p_propagate = repeat(self.p_h * (1 + self.p_veg) * (1 + self.p_den), 'h w -> h w 1 1') * p_s * p_w
+        # Temperature anomaly factor (Option 2: relative deviation from reference temperature).
+        # p_t > 1 when temperature exceeds T_ref (amplifies spread), p_t < 1 when below (suppresses spread).
+        # c_3 = 0 disables the factor entirely (exp(0) = 1), preserving backward compatibility.
+        T_anomaly = (self.temperature - self.T_ref) / self.T_ref
+        p_t = torch.exp(self.c_3 * T_anomaly)
+
+        p_propagate = repeat(self.p_h * (1 + self.p_veg) * (1 + self.p_den), 'h w -> h w 1 1') * p_s * p_w * repeat(p_t, 'h w -> h w 1 1')
 
         prob_like_act_c = 1.1486328125
         p_propagate = torch.tanh(prob_like_act_c * p_propagate)
