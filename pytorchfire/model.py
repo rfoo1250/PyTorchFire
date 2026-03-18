@@ -17,13 +17,15 @@ class WildfireModel(nn.Module):
 
     The model uses the following formula to calculate the probability of a cell propagating fire to its neighbors:
 
-    $$ p_\\text{propagate} = p_h (1 + p_\\text{veg}) (1 + p_\\text{den}) p_w p_s $$
+    $$ p_\\text{propagate} = p_h (1 + p_\\text{veg}) (1 + p_\\text{den}) (1 + p_\\text{fuel}) p_w p_s p_t $$
 
     in which,
 
     $$ p_w = \\exp(c_1 V_w) \\exp(c_2 V_w (\\cos(\\theta_w) - 1)) $$
 
     $$ p_s = \\exp(a \\theta_s) $$
+
+    $$ p_t = \\exp(c_3 \\cdot (T - T_\\text{ref}) / T_\\text{ref}) $$
 
     The model also uses the following formula to correct the probability into correct range:
 
@@ -120,6 +122,23 @@ class WildfireModel(nn.Module):
             - dtype: `torch.float`
             - shape: `[Height, Width]`
 
+        p_fuel (torch.Tensor):
+            Per-cell fire behavior fuel model scaling factor derived from the
+            Scott & Burgan 40 (SB40) fuel model system.
+
+            Loaded from a .npz file produced by ``bulk_fuel_tif_to_npz.py``,
+            which converts raw LANDFIRE FBfm40 integer codes to float32 values
+            in [0.0, 1.0] using the published SB40 rate-of-spread index.
+
+            Enters ``p_propagate`` as ``(1 + p_fuel)``, consistent with the
+            ``(1 + p_veg)`` and ``(1 + p_den)`` terms. A value of 0.0
+            (non-burnable cells: urban, water, bare rock) yields a factor of 1.0,
+            contributing no amplification. Higher values (e.g. 0.80 for SH7 very
+            high load dry shrub) strongly amplify propagation probability.
+
+            - dtype: `torch.float`
+            - shape: `[Height, Width]`
+
         wind_velocity (torch.Tensor):
             The wind velocity. Unit is m/s.
 
@@ -204,6 +223,7 @@ class WildfireModel(nn.Module):
     p_continue: nn.Parameter
     p_veg: torch.Tensor
     p_den: torch.Tensor
+    p_fuel: torch.Tensor
     wind_velocity: torch.Tensor
     wind_towards_direction: torch.Tensor
     slope: torch.Tensor
@@ -224,6 +244,9 @@ class WildfireModel(nn.Module):
 
                 - `p_veg` (torch.Tensor): The scaling factor for vegetation type.
                 - `p_den` (torch.Tensor): The scaling factor for vegetation density.
+                - `p_fuel` (torch.Tensor): Per-cell SB40 fuel model scaling factor, shape ``[Height, Width]``.
+                    Loaded from a .npz produced by ``bulk_fuel_tif_to_npz.py``.
+                    Defaults to ``0.0`` at every cell (neutral — no fuel amplification) when not provided.
                 - `wind_velocity` (torch.Tensor): The wind velocity. Unit is m/s.
                 - `wind_towards_direction` (torch.Tensor): The wind direction. Starting from East and going
                     counterclockwise in degrees.
@@ -270,6 +293,13 @@ class WildfireModel(nn.Module):
                 t_ref_array = src.read(1).astype('float32')
             t_ref_tensor = torch.from_numpy(t_ref_array)  # shape [H, W]
 
+            # Load p_fuel from the .npz produced by bulk_fuel_tif_to_npz.py
+            import numpy as np
+            fuel_data = np.load('FUEL_Plumas_CA_LANDFIRE_FBfm40.npz', allow_pickle=True)
+            p_fuel_tensor = torch.from_numpy(fuel_data['p_fuel'])  # float32 [H, W]
+
+            environment_data['p_fuel'] = p_fuel_tensor
+
             parameters = {
                 'a': torch.tensor(.1),
                 'p_h': torch.tensor(.3),
@@ -303,6 +333,9 @@ class WildfireModel(nn.Module):
 
         self.register_buffer('p_veg', env_data.get('p_veg', torch.zeros(DEFAULT_SIZE, DEFAULT_SIZE)))
         self.register_buffer('p_den', env_data.get('p_den', torch.zeros_like(self.p_veg)))
+        # p_fuel defaults to 0.0 (neutral — no amplification) so existing code that
+        # does not supply fuel data is fully backward compatible: (1 + 0.0) = 1.0.
+        self.register_buffer('p_fuel', env_data.get('p_fuel', torch.zeros_like(self.p_veg)))
         self.register_buffer('wind_velocity', env_data.get('wind_velocity', torch.zeros_like(self.p_veg)))
         self.register_buffer('wind_towards_direction',
                              env_data.get('wind_towards_direction', torch.zeros_like(self.p_veg)))
@@ -336,11 +369,11 @@ class WildfireModel(nn.Module):
         """
         assert self.a.shape == self.p_h.shape == self.c_1.shape == self.c_2.shape == self.c_3.shape == self.p_continue.shape == ()
         assert (
-                self.p_veg.shape == self.p_den.shape == self.wind_velocity.shape == self.wind_towards_direction.shape == self.temperature.shape == self.T_ref.shape == self.initial_ignition.shape)
+                self.p_veg.shape == self.p_den.shape == self.p_fuel.shape == self.wind_velocity.shape == self.wind_towards_direction.shape == self.temperature.shape == self.T_ref.shape == self.initial_ignition.shape)
         assert self.slope.shape == (*self.p_veg.shape, 3, 3)
         assert self.state.shape == (2, *self.p_veg.shape)
         assert (
-                self.a.device == self.p_h.device == self.c_1.device == self.c_2.device == self.c_3.device == self.p_continue.device == self.p_veg.device == self.p_den.device == self.wind_velocity.device == self.wind_towards_direction.device == self.temperature.device == self.T_ref.device == self.slope.device == self.initial_ignition.device == self.state.device)
+                self.a.device == self.p_h.device == self.c_1.device == self.c_2.device == self.c_3.device == self.p_continue.device == self.p_veg.device == self.p_den.device == self.p_fuel.device == self.wind_velocity.device == self.wind_towards_direction.device == self.temperature.device == self.T_ref.device == self.slope.device == self.initial_ignition.device == self.state.device)
         assert self.initial_ignition.dtype == self.state.dtype == torch.bool
         if self.training:
             assert self.accumulator.shape == self.initial_ignition.shape
@@ -443,13 +476,18 @@ class WildfireModel(nn.Module):
         p_w = torch.exp(self.c_1 * wind_velocity_expanded) * torch.exp(self.c_2 * wind_velocity_expanded * (
                 torch.cos(torch.deg2rad((wind_offset_tiled - wind_towards_direction_expanded) % 360)) - 1))
 
-        # Temperature anomaly factor (Option 2: relative deviation from reference temperature).
-        # p_t > 1 when temperature exceeds T_ref (amplifies spread), p_t < 1 when below (suppresses spread).
+        # Temperature anomaly factor: p_t > 1 amplifies spread above T_ref, < 1 suppresses below.
         # c_3 = 0 disables the factor entirely (exp(0) = 1), preserving backward compatibility.
         T_anomaly = (self.temperature - self.T_ref) / self.T_ref
         p_t = torch.exp(self.c_3 * T_anomaly)
 
-        p_propagate = repeat(self.p_h * (1 + self.p_veg) * (1 + self.p_den), 'h w -> h w 1 1') * p_s * p_w * repeat(p_t, 'h w -> h w 1 1')
+        # p_fuel encodes SB40 fire behavior fuel model intensity per cell [H, W].
+        # Enters as (1 + p_fuel), consistent with (1 + p_veg) and (1 + p_den).
+        # p_fuel = 0.0 for non-burnable cells → factor of 1.0, no amplification.
+        p_propagate = repeat(
+            self.p_h * (1 + self.p_veg) * (1 + self.p_den) * (1 + self.p_fuel),
+            'h w -> h w 1 1'
+        ) * p_s * p_w * repeat(p_t, 'h w -> h w 1 1')
 
         prob_like_act_c = 1.1486328125
         p_propagate = torch.tanh(prob_like_act_c * p_propagate)
